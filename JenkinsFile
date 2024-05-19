@@ -1,0 +1,153 @@
+pipeline {
+  agent any
+
+  environment {
+    deploymentName = "devsecops"
+    containerName = "devsecops-container"
+    serviceName = "devsecops-svc"
+    imageName = "docker-registry:5000/java-app:latest"
+    applicationURL = "http://controlplane:30010"
+    applicationURI = "/increment/99"
+  }
+
+  stages {
+
+    stage('Build Artifact - Maven') {
+      steps {
+        sh "mvn clean package -DskipTests=true"
+        archive 'target/*.jar'
+      }
+    }
+
+    stage('Unit Tests - JUnit and Jacoco') {
+      steps {
+        sh "mvn test"
+      }
+      post {
+        always {
+          junit 'target/surefire-reports/*.xml'
+          jacoco execPattern: 'target/jacoco.exec'
+        }
+      }
+    }
+
+stage('Mutation Tests - PIT') {
+      steps {
+        sh "mvn org.pitest:pitest-maven:mutationCoverage"
+      }
+    }
+
+
+ stage('SonarQube - SAST') {
+      steps {
+        withSonarQubeEnv('sonarqube') {
+          sh "mvn sonar:sonar \
+              -Dsonar.projectKey=devsecops-numeric-application \
+              -Dsonar.host.url=<sonarqube-server-url>"
+      }
+        timeout(time: 2, unit: 'MINUTES') {
+          script {
+            waitForQualityGate abortPipeline: true
+          }
+        }
+      }
+    }
+
+
+
+    stage('Vulnerability Scan - Docker') {
+      steps {
+        parallel(
+          "Dependency Scan": {
+            sh "mvn dependency-check:check"
+          },
+          "Trivy Scan": {
+            sh "bash trivy-docker-image-scan.sh"
+          },
+          "OPA Conftest": {
+            sh "/usr/local/bin/conftest test --policy opa-docker-security.rego Dockerfile"
+          }
+        )
+      }
+    }
+
+    stage('Docker Build and Push') {
+      steps {
+          sh 'sudo docker build -t docker-registry:5000/java-app:latest .'
+          sh 'docker push docker-registry:5000/java-app:latest'
+      }
+    }
+
+
+
+    stage('Vulnerability Scan - Kubernetes') {
+      steps {
+        parallel(
+            "KubeSec Scan": {
+
+                sh "bash kubesec-scan.sh"
+
+            },
+            "OPA Scan": {
+
+                        sh '/usr/local/bin/conftest test --policy opa-k8s-security.rego k8s_deployment_service.yaml'
+
+
+            }
+
+        )
+      }
+    }
+
+    stage('K8S Deployment - DEV') {
+      steps {
+        parallel(
+          "Deployment": {
+              sh "bash k8s-deployment.sh"
+          },
+          "Rollout Status": {
+              sh "bash k8s-deployment-rollout-status.sh"
+          }
+        )
+      }
+    }
+
+       stage('Integration Tests - DEV') {
+      steps {
+        script {
+          try {
+            sh "bash integration-test.sh"
+            }
+          catch (e) {
+            sh "kubectl -n default rollout undo deploy ${deploymentName}"
+          throw e
+          }
+        }
+      }
+    }
+
+  
+    stage('OWASP ZAP - DAST') {
+      steps {
+        sh 'bash zap.sh'
+      }
+    }
+
+
+    stage('Promote to Prod') {
+      agent{
+        label "controlplane"
+      }
+      steps {
+          sh 'bash cis-etcd.sh'
+          sh 'bash cis-master.sh'
+          sh 'bash cis-node.sh'
+      }
+    }
+
+
+  post {
+    always {
+      publishHTML([allowMissing: false, alwaysLinkToLastBuild: true, keepAll: true, reportDir: 'owasp-zap-report', reportFiles: 'zap_report.html', reportName: 'OWASP ZAP HTML Reports', reportTitles: 'OWASP ZAP HTML Reports'])
+    }
+}
